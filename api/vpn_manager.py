@@ -5,9 +5,13 @@ import uuid as uuid_lib
 from datetime import datetime, timedelta
 import os
 import sys
+import logging
+import base64
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bot.config import DB_FILE, XRAY_CONFIG_PATH
+
+logger = logging.getLogger(__name__)
 
 
 class VPNManager:
@@ -23,11 +27,13 @@ class VPNManager:
     def _ssh_command(self, server, command):
         """Выполняет команду на сервере по SSH"""
         ssh_cmd = f"ssh -o StrictHostKeyChecking=no {server['ssh_user']}@{server['ip']} \"{command}\""
+        logger.info(f"SSH команда: {ssh_cmd[:100]}...")
         try:
             result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True, timeout=30)
+            logger.info(f"SSH код: {result.returncode}, stdout: {result.stdout[:200] if result.stdout else 'пусто'}, stderr: {result.stderr[:200] if result.stderr else 'пусто'}")
             return result.stdout.strip(), result.returncode == 0
         except Exception as e:
-            print(f"SSH ошибка: {e}")
+            logger.error(f"SSH ошибка: {e}")
             return str(e), False
 
     def generate_uuid(self):
@@ -80,18 +86,21 @@ class VPNManager:
 
     def add_client_to_xray(self, server, uuid, email):
         """Добавляет клиента в конфиг Xray через SSH"""
+        logger.info(f"Добавляю клиента {email} на сервер {server['ip']}")
+
         # Читаем текущий конфиг
         read_cmd = f"cat {XRAY_CONFIG_PATH}"
         config_str, success = self._ssh_command(server, read_cmd)
 
         if not success:
-            print(f"Не удалось прочитать конфиг: {config_str}")
+            logger.error(f"Не удалось прочитать конфиг: {config_str}")
             return False
 
         try:
             config = json.loads(config_str)
+            logger.info("Конфиг успешно прочитан")
         except json.JSONDecodeError as e:
-            print(f"Ошибка парсинга конфига: {e}")
+            logger.error(f"Ошибка парсинга конфига: {e}, данные: {config_str[:500]}")
             return False
 
         # Добавляем клиента
@@ -102,17 +111,26 @@ class VPNManager:
         }
 
         config['inbounds'][0]['settings']['clients'].append(new_client)
+        logger.info(f"Клиент добавлен в конфиг, всего клиентов: {len(config['inbounds'][0]['settings']['clients'])}")
 
         # Записываем обновленный конфиг
-        config_json = json.dumps(config, indent=2).replace('"', '\\"')
-        write_cmd = f'echo "{config_json}" > {XRAY_CONFIG_PATH}'
+        config_json = json.dumps(config)
+        config_b64 = base64.b64encode(config_json.encode()).decode()
+        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
         _, success = self._ssh_command(server, write_cmd)
 
         if not success:
+            logger.error("Не удалось записать конфиг")
             return False
+
+        logger.info("Конфиг записан, перезапускаю xray")
 
         # Перезапускаем Xray
         _, success = self._ssh_command(server, "systemctl restart xray")
+        if success:
+            logger.info("Xray перезапущен успешно")
+        else:
+            logger.error("Ошибка перезапуска xray")
         return success
 
     def remove_client_from_xray(self, server, uuid):
