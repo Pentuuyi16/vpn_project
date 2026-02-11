@@ -40,14 +40,14 @@ class VPNManager:
         cursor = conn.cursor()
 
         try:
-            # Получаем сервера с количеством активных подписок
             cursor.execute("""
                 SELECT s.*,
                     (SELECT COUNT(*) FROM subscriptions sub
                      WHERE sub.server_id = s.id AND sub.is_active = 1) as current_users
                 FROM servers s
                 WHERE s.is_active = 1
-                HAVING current_users < s.max_users
+                AND (SELECT COUNT(*) FROM subscriptions sub
+                     WHERE sub.server_id = s.id AND sub.is_active = 1) < s.max_users
                 ORDER BY current_users ASC
                 LIMIT 1
             """)
