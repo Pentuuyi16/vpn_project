@@ -40,28 +40,36 @@ class VPNManager:
         """Генерирует UUID"""
         return str(uuid_lib.uuid4())
 
-    def get_available_server(self):
-        """Находит сервер с свободными местами"""
+    def get_available_servers(self):
+        """Получает все доступные серверы с свободными местами"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
             cursor.execute("""
                 SELECT s.*,
-                    (SELECT COUNT(*) FROM subscriptions sub
-                     WHERE sub.server_id = s.id AND sub.is_active = 1) as current_users
+                    (SELECT COUNT(DISTINCT ss.subscription_id)
+                     FROM subscription_servers ss
+                     JOIN subscriptions sub ON ss.subscription_id = sub.id
+                     WHERE ss.server_id = s.id AND sub.is_active = 1) as current_users
                 FROM servers s
                 WHERE s.is_active = 1
-                AND (SELECT COUNT(*) FROM subscriptions sub
-                     WHERE sub.server_id = s.id AND sub.is_active = 1) < s.max_users
+                AND (SELECT COUNT(DISTINCT ss.subscription_id)
+                     FROM subscription_servers ss
+                     JOIN subscriptions sub ON ss.subscription_id = sub.id
+                     WHERE ss.server_id = s.id AND sub.is_active = 1) < s.max_users
                 ORDER BY current_users ASC
-                LIMIT 1
             """)
 
-            server = cursor.fetchone()
-            return dict(server) if server else None
+            servers = cursor.fetchall()
+            return [dict(server) for server in servers]
         finally:
             conn.close()
+
+    def get_available_server(self):
+        """Находит один сервер с свободными местами (для обратной совместимости)"""
+        servers = self.get_available_servers()
+        return servers[0] if servers else None
 
     def get_server_by_id(self, server_id):
         """Получает сервер по ID"""
@@ -158,15 +166,15 @@ class VPNManager:
         return True
 
     def create_subscription(self, telegram_id, username, duration_days=30):
-        """Создает новую подписку для пользователя"""
+        """Создает новую подписку для пользователя на всех доступных серверах"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
-            # Находим доступный сервер
-            server = self.get_available_server()
-            if not server:
-                print("Нет доступных серверов")
+            # Находим все доступные серверы
+            servers = self.get_available_servers()
+            if not servers:
+                logger.error("Нет доступных серверов")
                 return None
 
             # Проверяем/создаем пользователя
@@ -182,85 +190,153 @@ class VPNManager:
             else:
                 user_id = user[0]
 
-            # Генерируем UUID
+            # Генерируем один UUID для всех серверов
             client_uuid = self.generate_uuid()
+            subscription_token = self.generate_uuid()  # Токен для subscription URL
             email = f"user_{telegram_id}_{int(datetime.now().timestamp())}"
 
-            # Создаем ссылку
-            config_link = self.create_vless_link(client_uuid, server, f"VPN_{username or telegram_id}")
-
-            # Добавляем в Xray на сервере
-            if not self.add_client_to_xray(server, client_uuid, email):
-                print("Не удалось добавить клиента в Xray")
-                return None
-
-            # Сохраняем в БД
+            # Создаем подписку
             expires_at = datetime.now() + timedelta(days=duration_days)
             cursor.execute("""
-                INSERT INTO subscriptions (user_id, server_id, uuid, config_link, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, server['id'], client_uuid, config_link, expires_at.strftime('%Y-%m-%d %H:%M:%S')))
+                INSERT INTO subscriptions (user_id, uuid, subscription_token, expires_at)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, client_uuid, subscription_token, expires_at.strftime('%Y-%m-%d %H:%M:%S')))
+
+            subscription_id = cursor.lastrowid
+
+            # Добавляем клиента на каждый сервер
+            config_links = []
+            server_names = []
+
+            for server in servers:
+                # Создаем VLESS ссылку для этого сервера
+                server_name = server['name']
+                config_link = self.create_vless_link(
+                    client_uuid,
+                    server,
+                    f"{server_name}_{username or telegram_id}"
+                )
+
+                # Добавляем клиента в Xray на сервере
+                if not self.add_client_to_xray(server, client_uuid, email):
+                    logger.error(f"Не удалось добавить клиента на сервер {server_name}")
+                    # Продолжаем с другими серверами
+                    continue
+
+                # Сохраняем связь подписка-сервер
+                cursor.execute("""
+                    INSERT INTO subscription_servers (subscription_id, server_id, config_link)
+                    VALUES (?, ?, ?)
+                """, (subscription_id, server['id'], config_link))
+
+                config_links.append(config_link)
+                server_names.append(server_name)
+
+            if not config_links:
+                logger.error("Не удалось добавить клиента ни на один сервер")
+                conn.rollback()
+                return None
 
             conn.commit()
 
             return {
                 'uuid': client_uuid,
-                'config_link': config_link,
+                'subscription_token': subscription_token,
+                'config_links': config_links,
+                'server_names': server_names,
                 'expires_at': expires_at.strftime('%Y-%m-%d %H:%M:%S'),
-                'server_name': server['name']
+                # Для обратной совместимости
+                'config_link': config_links[0] if config_links else None,
+                'server_name': ', '.join(server_names)
             }
         except Exception as e:
-            print(f"Ошибка создания подписки: {e}")
+            logger.error(f"Ошибка создания подписки: {e}")
             conn.rollback()
             return None
         finally:
             conn.close()
 
     def get_active_subscription(self, telegram_id):
-        """Получает активную подписку пользователя"""
+        """Получает активную подписку пользователя со всеми серверами"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
             cursor.execute("""
-                SELECT sub.*, srv.name as server_name
+                SELECT sub.*
                 FROM subscriptions sub
                 JOIN users u ON sub.user_id = u.id
-                JOIN servers srv ON sub.server_id = srv.id
                 WHERE u.telegram_id = ? AND sub.is_active = 1
                 ORDER BY sub.expires_at DESC LIMIT 1
             """, (telegram_id,))
 
             result = cursor.fetchone()
-            return dict(result) if result else None
+            if not result:
+                return None
+
+            subscription = dict(result)
+
+            # Получаем все сервера для этой подписки
+            cursor.execute("""
+                SELECT ss.config_link, srv.name as server_name, srv.ip
+                FROM subscription_servers ss
+                JOIN servers srv ON ss.server_id = srv.id
+                WHERE ss.subscription_id = ?
+                ORDER BY srv.name
+            """, (subscription['id'],))
+
+            servers_data = cursor.fetchall()
+            if servers_data:
+                subscription['config_links'] = [dict(s)['config_link'] for s in servers_data]
+                subscription['server_names'] = [dict(s)['server_name'] for s in servers_data]
+                # Для обратной совместимости
+                subscription['config_link'] = subscription['config_links'][0]
+                subscription['server_name'] = ', '.join(subscription['server_names'])
+            else:
+                # Fallback для старых подписок
+                subscription['config_links'] = []
+                subscription['server_names'] = []
+
+            return subscription
         finally:
             conn.close()
 
     def deactivate_subscription(self, subscription_id):
-        """Деактивирует подписку"""
+        """Деактивирует подписку и удаляет клиента со всех серверов"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
         try:
-            # Получаем подписку и сервер
-            cursor.execute("""
-                SELECT sub.uuid, sub.server_id FROM subscriptions sub
-                WHERE sub.id = ?
-            """, (subscription_id,))
+            # Получаем подписку
+            cursor.execute("SELECT uuid FROM subscriptions WHERE id = ?", (subscription_id,))
             sub = cursor.fetchone()
 
             if not sub:
                 return False
 
-            server = self.get_server_by_id(sub['server_id'])
-            if server:
-                self.remove_client_from_xray(server, sub['uuid'])
+            client_uuid = sub['uuid']
 
+            # Получаем все сервера для этой подписки
+            cursor.execute("""
+                SELECT ss.server_id
+                FROM subscription_servers ss
+                WHERE ss.subscription_id = ?
+            """, (subscription_id,))
+
+            server_ids = cursor.fetchall()
+
+            # Удаляем клиента с каждого сервера
+            for row in server_ids:
+                server = self.get_server_by_id(row['server_id'])
+                if server:
+                    self.remove_client_from_xray(server, client_uuid)
+
+            # Деактивируем подписку
             cursor.execute("UPDATE subscriptions SET is_active = 0 WHERE id = ?", (subscription_id,))
             conn.commit()
             return True
         except Exception as e:
-            print(f"Ошибка деактивации: {e}")
+            logger.error(f"Ошибка деактивации: {e}")
             conn.rollback()
             return False
         finally:
@@ -296,8 +372,10 @@ class VPNManager:
         try:
             cursor.execute("""
                 SELECT s.*,
-                    (SELECT COUNT(*) FROM subscriptions sub
-                     WHERE sub.server_id = s.id AND sub.is_active = 1) as current_users
+                    (SELECT COUNT(DISTINCT ss.subscription_id)
+                     FROM subscription_servers ss
+                     JOIN subscriptions sub ON ss.subscription_id = sub.id
+                     WHERE ss.server_id = s.id AND sub.is_active = 1) as current_users
                 FROM servers s
                 ORDER BY s.id
             """)

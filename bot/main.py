@@ -14,7 +14,7 @@ from telegram.ext import (
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot.config import TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID
+from bot.config import TELEGRAM_BOT_TOKEN, ADMIN_TELEGRAM_ID, SUBSCRIPTION_URL_BASE
 from bot.keyboards import main_menu, buy_subscription_menu, admin_menu, servers_menu
 from api.vpn_manager import VPNManager
 from api.database import init_database
@@ -58,15 +58,31 @@ async def my_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     expires_at = datetime.strptime(subscription['expires_at'], '%Y-%m-%d %H:%M:%S')
-    days_left = (expires_at - datetime.now()).days
+    days_left = max(0, (expires_at - datetime.now()).days)
+
+    # Формируем subscription URL
+    subscription_url = f"{SUBSCRIPTION_URL_BASE}/{subscription['subscription_token']}"
+
+    # Формируем сообщение
+    message = (
+        f"🔑 <b>Ваша подписка VPN</b>\n\n"
+        f"📡 Серверы: {subscription.get('server_name', 'N/A')}\n"
+        f"📅 Действует до: {expires_at.strftime('%d.%m.%Y')}\n"
+        f"⏰ Осталось дней: {days_left}\n\n"
+        f"<b>Рекомендуемый способ подключения:</b>\n"
+        f"Subscription URL (автоматически подключает все серверы):\n\n"
+        f"<code>{subscription_url}</code>\n\n"
+        f"Нажмите на ссылку чтобы скопировать, затем добавьте её в приложении.\n"
+    )
+
+    # Добавляем отдельные ключи если есть
+    if subscription.get('config_links'):
+        message += "\n<b>Или используйте отдельные ключи:</b>\n\n"
+        for i, (link, name) in enumerate(zip(subscription['config_links'], subscription['server_names']), 1):
+            message += f"{i}. {name}:\n<code>{link}</code>\n\n"
 
     await update.message.reply_text(
-        f"Ваш ключ доступа:\n\n"
-        f"<code>{subscription['config_link']}</code>\n\n"
-        f"Сервер: {subscription.get('server_name', 'N/A')}\n"
-        f"Действует до: {expires_at.strftime('%d.%m.%Y')}\n"
-        f"Осталось дней: {days_left}\n\n"
-        f"Нажмите на ключ чтобы скопировать",
+        message,
         parse_mode='HTML',
         reply_markup=main_menu()
     )
@@ -98,16 +114,26 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Инструкция по подключению"""
     await update.message.reply_text(
-        "Инструкция по подключению:\n\n"
-        "1. Скачайте приложение:\n"
-        "   iOS: v2rayTUN или Happ\n"
-        "   Android: v2rayNG\n\n"
-        "2. Купите подписку и получите ключ\n\n"
-        "3. Скопируйте ключ (нажмите на него)\n\n"
-        "4. В приложении нажмите + и выберите\n"
-        "   'Import from clipboard'\n\n"
-        "5. Подключитесь к VPN\n\n"
-        "Готово!",
+        "📖 <b>Инструкция по подключению:</b>\n\n"
+        "<b>Шаг 1:</b> Скачайте приложение\n"
+        "   • iOS: v2rayTUN или Happ\n"
+        "   • Android: v2rayNG\n\n"
+        "<b>Шаг 2:</b> Купите подписку\n"
+        "   Вы получите Subscription URL\n\n"
+        "<b>Шаг 3:</b> Добавьте подписку\n"
+        "   • Скопируйте Subscription URL\n"
+        "   • В приложении нажмите + (добавить)\n"
+        "   • Выберите 'Import from clipboard' или 'Add subscription'\n"
+        "   • Вставьте ссылку\n\n"
+        "<b>Шаг 4:</b> Выберите сервер\n"
+        "   В приложении появятся все доступные серверы.\n"
+        "   Выберите нужный (Netherlands, Germany и т.д.)\n\n"
+        "<b>Шаг 5:</b> Подключитесь\n"
+        "   Нажмите кнопку подключения\n\n"
+        "✅ Готово! Можете переключаться между серверами в любой момент.\n\n"
+        "💡 <b>Совет:</b> Используйте Subscription URL вместо отдельных ключей - "
+        "так вы автоматически получите доступ ко всем серверам!",
+        parse_mode='HTML',
         reply_markup=main_menu()
     )
 
@@ -195,18 +221,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if result:
             expires_date = datetime.strptime(result['expires_at'], '%Y-%m-%d %H:%M:%S')
+            subscription_url = f"{SUBSCRIPTION_URL_BASE}/{result['subscription_token']}"
 
-            await query.edit_message_text(
-                f"Подписка активирована!\n\n"
-                f"Тариф: {get_plan_name(plan)}\n"
-                f"Сервер: {result.get('server_name', 'N/A')}\n"
-                f"Действует до: {expires_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-                f"Ваш ключ доступа:\n\n"
-                f"<code>{result['config_link']}</code>\n\n"
-                f"Нажмите на ключ чтобы скопировать\n"
-                f"Инструкция: /start -> Инструкция",
-                parse_mode='HTML'
+            message = (
+                f"✅ <b>Подписка активирована!</b>\n\n"
+                f"📦 Тариф: {get_plan_name(plan)}\n"
+                f"📡 Серверы: {result.get('server_name', 'N/A')}\n"
+                f"📅 Действует до: {expires_date.strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"<b>🔗 Subscription URL (рекомендуется):</b>\n"
+                f"<code>{subscription_url}</code>\n\n"
+                f"Этот URL автоматически добавит ВСЕ серверы в ваше приложение.\n"
+                f"Вы сможете переключаться между ними в один клик!\n\n"
+                f"<b>Как использовать:</b>\n"
+                f"1. Скопируйте ссылку выше\n"
+                f"2. В приложении (v2rayTUN/Happ/v2rayNG) нажмите +\n"
+                f"3. Выберите 'Import from clipboard' или вставьте URL\n"
+                f"4. Готово! Все серверы добавлены\n\n"
+                f"📖 Подробная инструкция: /start -> Инструкция"
             )
+
+            # Добавляем отдельные ключи для ручного добавления
+            if result.get('config_links'):
+                message += "\n\n<b>Или добавьте серверы вручную:</b>\n"
+                for i, (link, name) in enumerate(zip(result['config_links'], result['server_names']), 1):
+                    message += f"\n{i}. {name}:\n<code>{link}</code>\n"
+
+            await query.edit_message_text(message, parse_mode='HTML')
         else:
             await query.edit_message_text(
                 "Ошибка создания подписки.\n\n"

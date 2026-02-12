@@ -42,14 +42,26 @@ def init_database():
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            server_id INTEGER NOT NULL,
             uuid TEXT UNIQUE NOT NULL,
-            config_link TEXT NOT NULL,
+            subscription_token TEXT UNIQUE NOT NULL,
             is_active INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             expires_at TIMESTAMP NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (server_id) REFERENCES servers(id)
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Таблица связи подписок и серверов (many-to-many)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscription_id INTEGER NOT NULL,
+            server_id INTEGER NOT NULL,
+            config_link TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+            FOREIGN KEY (server_id) REFERENCES servers(id),
+            UNIQUE(subscription_id, server_id)
         )
     """)
 

@@ -23,3 +23,6 @@ PRICES = {
 
 # Server limits
 MAX_USERS_PER_SERVER = 60
+
+# Subscription URL (замените на ваш домен)
+SUBSCRIPTION_URL_BASE = os.getenv('SUBSCRIPTION_URL_BASE', 'https://your-domain.com/sub')
