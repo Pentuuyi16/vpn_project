@@ -214,7 +214,7 @@ class VPNManager:
                 config_link = self.create_vless_link(
                     client_uuid,
                     server,
-                    f"{server_name}_{username or telegram_id}"
+                    server_name
                 )
 
                 # Добавляем клиента в Xray на сервере
