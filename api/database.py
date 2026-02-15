@@ -65,6 +65,20 @@ def init_database():
         )
     """)
 
+    # Пул предгенерированных UUID (уже добавлены в Xray конфиг)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uuid_pool (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uuid TEXT NOT NULL,
+            email TEXT NOT NULL,
+            server_id INTEGER NOT NULL,
+            is_used INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (server_id) REFERENCES servers(id),
+            UNIQUE(uuid, server_id)
+        )
+    """)
+
     conn.commit()
     conn.close()
     print("База данных инициализирована")
@@ -86,6 +100,28 @@ def add_server(name, ip, port, public_key, ssh_user='root', max_users=60):
 
     print(f"Сервер '{name}' добавлен с ID: {server_id}")
     return server_id
+
+
+def import_uuid_pool(uuids, server_id):
+    """Импортирует пул UUID в базу данных"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    count = 0
+    for item in uuids:
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO uuid_pool (uuid, email, server_id)
+                VALUES (?, ?, ?)
+            """, (item['uuid'], item['email'], server_id))
+            if cursor.rowcount > 0:
+                count += 1
+        except Exception as e:
+            print(f"Ошибка импорта {item['uuid']}: {e}")
+
+    conn.commit()
+    conn.close()
+    return count
 
 
 if __name__ == "__main__":

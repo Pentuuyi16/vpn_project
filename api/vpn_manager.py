@@ -30,7 +30,7 @@ class VPNManager:
         logger.info(f"SSH команда: {ssh_cmd[:100]}...")
         try:
             result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True, timeout=30)
-            logger.info(f"SSH код: {result.returncode}, stdout: {result.stdout[:200] if result.stdout else 'пусто'}, stderr: {result.stderr[:200] if result.stderr else 'пусто'}")
+            logger.info(f"SSH код: {result.returncode}")
             return result.stdout.strip(), result.returncode == 0
         except Exception as e:
             logger.error(f"SSH ошибка: {e}")
@@ -92,212 +92,73 @@ class VPNManager:
             f"&type=tcp&headerType=none#{name}"
         )
 
-    def add_client_via_api(self, server, uuid, email):
-        """Добавляет клиента через Xray gRPC API без перезапуска"""
-        # adu = Add User (НЕ adi, который Add Inbound)
-        api_cmd = (
-            f"xray api adu -s 127.0.0.1:10085 "
-            f"--inbound=vless "
-            f"--email={email} "
-            f"--id={uuid} "
-            f"--flow=xtls-rprx-vision"
-        )
-        result, success = self._ssh_command(server, api_cmd)
-
-        if success:
-            logger.info(f"Клиент {email} добавлен через API (adu)")
-            return True
-        else:
-            logger.warning(f"API adu не сработал: {result}")
-            return False
-
-    def add_client_to_xray(self, server, uuid, email):
-        """Добавляет клиента в Xray через SSH"""
-        logger.info(f"Добавляю клиента {email} на сервер {server['ip']}")
-
-        # Сначала пробуем через API (без перезапуска)
-        if self.add_client_via_api(server, uuid, email):
-            # API сработал, сохраняем в конфиг для персистентности (без restart)
-            self._save_client_to_config(server, uuid, email)
-            return True
-
-        # Fallback: старый способ с перезапуском
-        logger.info("Используем fallback с перезапуском")
-        return self._add_client_with_restart(server, uuid, email)
-
-    def _save_client_to_config(self, server, uuid, email):
-        """Сохраняет клиента в конфиг без перезапуска (для персистентности)"""
-        read_cmd = f"cat {XRAY_CONFIG_PATH}"
-        config_str, success = self._ssh_command(server, read_cmd)
-
-        if not success:
-            logger.error(f"Не удалось прочитать конфиг для сохранения")
-            return False
+    def _get_free_uuid_from_pool(self, server_id):
+        """Берёт свободный UUID из пула для сервера"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
 
         try:
-            config = json.loads(config_str)
-        except json.JSONDecodeError:
-            return False
+            cursor.execute("""
+                SELECT id, uuid, email FROM uuid_pool
+                WHERE server_id = ? AND is_used = 0
+                LIMIT 1
+            """, (server_id,))
 
-        # Ищем VLESS inbound
-        vless_inbound = None
-        for inbound in config.get('inbounds', []):
-            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
-                vless_inbound = inbound
-                break
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+        finally:
+            conn.close()
 
-        if not vless_inbound:
-            # Fallback на первый inbound
-            vless_inbound = config['inbounds'][0]
-
-        clients = vless_inbound['settings']['clients']
-
-        # Проверяем, нет ли уже такого клиента
-        if any(c['id'] == uuid for c in clients):
-            return True  # Уже есть
-
-        # Добавляем клиента
-        new_client = {
-            "id": uuid,
-            "flow": "xtls-rprx-vision",
-            "email": email
-        }
-        clients.append(new_client)
-
-        # Записываем конфиг
-        config_json = json.dumps(config)
-        config_b64 = base64.b64encode(config_json.encode()).decode()
-        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
-        _, success = self._ssh_command(server, write_cmd)
-
-        if success:
-            logger.info("Клиент сохранён в конфиг (без рестарта)")
-        return success
-
-    def _add_client_with_restart(self, server, uuid, email):
-        """Добавляет клиента через конфиг с перезапуском (fallback)"""
-        # Читаем текущий конфиг
-        read_cmd = f"cat {XRAY_CONFIG_PATH}"
-        config_str, success = self._ssh_command(server, read_cmd)
-
-        if not success:
-            logger.error(f"Не удалось прочитать конфиг: {config_str}")
-            return False
+    def _mark_uuid_used(self, pool_id):
+        """Помечает UUID из пула как использованный"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
 
         try:
-            config = json.loads(config_str)
-            logger.info("Конфиг успешно прочитан")
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка парсинга конфига: {e}, данные: {config_str[:500]}")
-            return False
+            cursor.execute("UPDATE uuid_pool SET is_used = 1 WHERE id = ?", (pool_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
-        # Ищем VLESS inbound
-        vless_inbound = None
-        for inbound in config.get('inbounds', []):
-            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
-                vless_inbound = inbound
-                break
-
-        if not vless_inbound:
-            vless_inbound = config['inbounds'][0]
-
-        # Добавляем клиента
-        new_client = {
-            "id": uuid,
-            "flow": "xtls-rprx-vision",
-            "email": email
-        }
-
-        vless_inbound['settings']['clients'].append(new_client)
-        logger.info(f"Клиент добавлен в конфиг, всего клиентов: {len(vless_inbound['settings']['clients'])}")
-
-        # Записываем обновленный конфиг
-        config_json = json.dumps(config)
-        config_b64 = base64.b64encode(config_json.encode()).decode()
-        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
-        _, success = self._ssh_command(server, write_cmd)
-
-        if not success:
-            logger.error("Не удалось записать конфиг")
-            return False
-
-        logger.info("Конфиг записан, перезапускаю xray")
-
-        # Перезапускаем Xray
-        _, success = self._ssh_command(server, "systemctl restart xray")
-        if success:
-            logger.info("Xray перезапущен успешно")
-        else:
-            logger.error("Ошибка перезапуска xray")
-        return success
-
-    def remove_client_via_api(self, server, email):
-        """Удаляет клиента через Xray gRPC API без перезапуска"""
-        # rmu = Remove User (НЕ rmi, который Remove Inbound)
-        api_cmd = f'xray api rmu -s 127.0.0.1:10085 --inbound=vless --email={email}'
-        result, success = self._ssh_command(server, api_cmd)
-
-        if success:
-            logger.info(f"Клиент {email} удалён через API (rmu)")
-            return True
-        else:
-            logger.warning(f"API rmu не сработал: {result}")
-            return False
-
-    def remove_client_from_xray(self, server, uuid):
-        """Удаляет клиента из Xray через SSH"""
-        # Читаем конфиг чтобы найти email клиента
-        read_cmd = f"cat {XRAY_CONFIG_PATH}"
-        config_str, success = self._ssh_command(server, read_cmd)
-
-        if not success:
-            return False
+    def _mark_uuid_free(self, uuid_value, server_id):
+        """Возвращает UUID в пул (при деактивации подписки)"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
 
         try:
-            config = json.loads(config_str)
-        except:
-            return False
+            cursor.execute("""
+                UPDATE uuid_pool SET is_used = 0
+                WHERE uuid = ? AND server_id = ?
+            """, (uuid_value, server_id))
+            conn.commit()
+        finally:
+            conn.close()
 
-        # Ищем VLESS inbound
-        vless_inbound = None
-        for inbound in config.get('inbounds', []):
-            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
-                vless_inbound = inbound
-                break
+    def get_pool_stats(self):
+        """Статистика по пулу UUID"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
 
-        if not vless_inbound:
-            vless_inbound = config['inbounds'][0]
-
-        clients = vless_inbound['settings']['clients']
-
-        # Находим email клиента по uuid
-        client_email = None
-        for c in clients:
-            if c['id'] == uuid:
-                client_email = c.get('email')
-                break
-
-        # Пробуем удалить через API (без перезапуска)
-        if client_email and self.remove_client_via_api(server, client_email):
-            # Удаляем из конфига для персистентности (без restart)
-            vless_inbound['settings']['clients'] = [c for c in clients if c['id'] != uuid]
-            config_json = json.dumps(config)
-            config_b64 = base64.b64encode(config_json.encode()).decode()
-            write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
-            self._ssh_command(server, write_cmd)
-            return True
-
-        # Fallback: удаляем из конфига и перезапускаем
-        vless_inbound['settings']['clients'] = [c for c in clients if c['id'] != uuid]
-        config_json = json.dumps(config)
-        config_b64 = base64.b64encode(config_json.encode()).decode()
-        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
-        self._ssh_command(server, write_cmd)
-        self._ssh_command(server, "systemctl restart xray")
-        return True
+        try:
+            cursor.execute("""
+                SELECT s.name, s.id as server_id,
+                    (SELECT COUNT(*) FROM uuid_pool WHERE server_id = s.id) as total,
+                    (SELECT COUNT(*) FROM uuid_pool WHERE server_id = s.id AND is_used = 0) as free,
+                    (SELECT COUNT(*) FROM uuid_pool WHERE server_id = s.id AND is_used = 1) as used
+                FROM servers s
+                WHERE s.is_active = 1
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
 
     def create_subscription(self, telegram_id, username, duration_days=30):
-        """Создает новую подписку для пользователя на всех доступных серверах"""
+        """
+        Создает подписку БЕЗ SSH и БЕЗ перезапуска Xray.
+        Берёт свободный UUID из предгенерированного пула.
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
 
@@ -321,10 +182,16 @@ class VPNManager:
             else:
                 user_id = user[0]
 
-            # Генерируем один UUID для всех серверов
-            client_uuid = self.generate_uuid()
-            subscription_token = self.generate_uuid()  # Токен для subscription URL
-            email = f"user_{telegram_id}_{int(datetime.now().timestamp())}"
+            # Берём свободный UUID из пула для первого сервера
+            first_server = servers[0]
+            pool_entry = self._get_free_uuid_from_pool(first_server['id'])
+
+            if not pool_entry:
+                logger.error(f"Нет свободных UUID в пуле для сервера {first_server['name']}")
+                return None
+
+            client_uuid = pool_entry['uuid']
+            subscription_token = self.generate_uuid()
 
             # Создаем подписку
             expires_at = datetime.now() + timedelta(days=duration_days)
@@ -335,24 +202,30 @@ class VPNManager:
 
             subscription_id = cursor.lastrowid
 
-            # Добавляем клиента на каждый сервер
+            # Назначаем UUID на серверы
             config_links = []
             server_names = []
+            used_pool_ids = []
 
             for server in servers:
-                # Создаем VLESS ссылку для этого сервера
+                # Для первого сервера используем уже полученный UUID
+                if server['id'] == first_server['id']:
+                    pool = pool_entry
+                else:
+                    # Для дополнительных серверов ищем тот же UUID в их пуле
+                    # (если пулы генерились с одинаковыми UUID на все серверы)
+                    # Или берём отдельный свободный UUID
+                    pool = self._get_free_uuid_from_pool(server['id'])
+                    if not pool:
+                        logger.warning(f"Нет свободных UUID для сервера {server['name']}, пропускаю")
+                        continue
+
                 server_name = server['name']
                 config_link = self.create_vless_link(
-                    client_uuid,
+                    pool['uuid'] if server['id'] != first_server['id'] else client_uuid,
                     server,
                     server_name
                 )
-
-                # Добавляем клиента в Xray на сервере
-                if not self.add_client_to_xray(server, client_uuid, email):
-                    logger.error(f"Не удалось добавить клиента на сервер {server_name}")
-                    # Продолжаем с другими серверами
-                    continue
 
                 # Сохраняем связь подписка-сервер
                 cursor.execute("""
@@ -362,13 +235,20 @@ class VPNManager:
 
                 config_links.append(config_link)
                 server_names.append(server_name)
+                used_pool_ids.append((pool['id'], server['id']))
 
             if not config_links:
-                logger.error("Не удалось добавить клиента ни на один сервер")
+                logger.error("Не удалось назначить UUID ни на один сервер")
                 conn.rollback()
                 return None
 
+            # Помечаем UUID как использованные
+            for pool_id, _ in used_pool_ids:
+                cursor.execute("UPDATE uuid_pool SET is_used = 1 WHERE id = ?", (pool_id,))
+
             conn.commit()
+
+            logger.info(f"Подписка создана для {telegram_id} без SSH/restart!")
 
             return {
                 'uuid': client_uuid,
@@ -376,7 +256,6 @@ class VPNManager:
                 'config_links': config_links,
                 'server_names': server_names,
                 'expires_at': expires_at.strftime('%Y-%m-%d %H:%M:%S'),
-                # Для обратной совместимости
                 'config_link': config_links[0] if config_links else None,
                 'server_name': ', '.join(server_names)
             }
@@ -420,11 +299,9 @@ class VPNManager:
             if servers_data:
                 subscription['config_links'] = [dict(s)['config_link'] for s in servers_data]
                 subscription['server_names'] = [dict(s)['server_name'] for s in servers_data]
-                # Для обратной совместимости
                 subscription['config_link'] = subscription['config_links'][0]
                 subscription['server_name'] = ', '.join(subscription['server_names'])
             else:
-                # Fallback для старых подписок
                 subscription['config_links'] = []
                 subscription['server_names'] = []
 
@@ -433,7 +310,7 @@ class VPNManager:
             conn.close()
 
     def deactivate_subscription(self, subscription_id):
-        """Деактивирует подписку и удаляет клиента со всех серверов"""
+        """Деактивирует подписку и возвращает UUID в пул"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
@@ -456,15 +333,18 @@ class VPNManager:
 
             server_ids = cursor.fetchall()
 
-            # Удаляем клиента с каждого сервера
+            # Возвращаем UUID в пул для каждого сервера
             for row in server_ids:
-                server = self.get_server_by_id(row['server_id'])
-                if server:
-                    self.remove_client_from_xray(server, client_uuid)
+                cursor.execute("""
+                    UPDATE uuid_pool SET is_used = 0
+                    WHERE uuid = ? AND server_id = ?
+                """, (client_uuid, row['server_id']))
 
             # Деактивируем подписку
             cursor.execute("UPDATE subscriptions SET is_active = 0 WHERE id = ?", (subscription_id,))
             conn.commit()
+
+            logger.info(f"Подписка {subscription_id} деактивирована, UUID возвращён в пул")
             return True
         except Exception as e:
             logger.error(f"Ошибка деактивации: {e}")
@@ -529,10 +409,15 @@ class VPNManager:
             cursor.execute("SELECT COUNT(*) FROM servers WHERE is_active = 1")
             active_servers = cursor.fetchone()[0]
 
+            # Статистика пула
+            cursor.execute("SELECT COUNT(*) FROM uuid_pool WHERE is_used = 0")
+            free_uuids = cursor.fetchone()[0]
+
             return {
                 'total_users': total_users,
                 'active_subscriptions': active_subs,
-                'active_servers': active_servers
+                'active_servers': active_servers,
+                'free_uuids': free_uuids
             }
         finally:
             conn.close()
