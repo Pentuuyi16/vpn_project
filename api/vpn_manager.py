@@ -26,7 +26,7 @@ class VPNManager:
 
     def _ssh_command(self, server, command):
         """Выполняет команду на сервере по SSH"""
-        ssh_cmd = f"ssh -o StrictHostKeyChecking=no {server['ssh_user']}@{server['ip']} \"{command}\""
+        ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {server['ssh_user']}@{server['ip']} \"{command}\""
         logger.info(f"SSH команда: {ssh_cmd[:100]}...")
         try:
             result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True, timeout=30)
@@ -93,25 +93,31 @@ class VPNManager:
         )
 
     def add_client_via_api(self, server, uuid, email):
-        """Добавляет клиента через Xray API без перезапуска"""
-        # Формируем команду для Xray API
-        api_cmd = f'xray api adi -s 127.0.0.1:10085 user --inbound=vless --email={email} --uuid={uuid} --flow=xtls-rprx-vision'
+        """Добавляет клиента через Xray gRPC API без перезапуска"""
+        # adu = Add User (НЕ adi, который Add Inbound)
+        api_cmd = (
+            f"xray api adu -s 127.0.0.1:10085 "
+            f"--inbound=vless "
+            f"--email={email} "
+            f"--id={uuid} "
+            f"--flow=xtls-rprx-vision"
+        )
         result, success = self._ssh_command(server, api_cmd)
 
         if success:
-            logger.info(f"Клиент {email} добавлен через API")
+            logger.info(f"Клиент {email} добавлен через API (adu)")
             return True
         else:
-            logger.warning(f"API не сработал: {result}, пробую через конфиг")
+            logger.warning(f"API adu не сработал: {result}")
             return False
 
     def add_client_to_xray(self, server, uuid, email):
-        """Добавляет клиента в конфиг Xray через SSH"""
+        """Добавляет клиента в Xray через SSH"""
         logger.info(f"Добавляю клиента {email} на сервер {server['ip']}")
 
         # Сначала пробуем через API (без перезапуска)
         if self.add_client_via_api(server, uuid, email):
-            # API сработал, но нужно также сохранить в конфиг для персистентности
+            # API сработал, сохраняем в конфиг для персистентности (без restart)
             self._save_client_to_config(server, uuid, email)
             return True
 
@@ -133,8 +139,20 @@ class VPNManager:
         except json.JSONDecodeError:
             return False
 
+        # Ищем VLESS inbound
+        vless_inbound = None
+        for inbound in config.get('inbounds', []):
+            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
+                vless_inbound = inbound
+                break
+
+        if not vless_inbound:
+            # Fallback на первый inbound
+            vless_inbound = config['inbounds'][0]
+
+        clients = vless_inbound['settings']['clients']
+
         # Проверяем, нет ли уже такого клиента
-        clients = config['inbounds'][0]['settings']['clients']
         if any(c['id'] == uuid for c in clients):
             return True  # Уже есть
 
@@ -144,7 +162,7 @@ class VPNManager:
             "flow": "xtls-rprx-vision",
             "email": email
         }
-        config['inbounds'][0]['settings']['clients'].append(new_client)
+        clients.append(new_client)
 
         # Записываем конфиг
         config_json = json.dumps(config)
@@ -153,7 +171,7 @@ class VPNManager:
         _, success = self._ssh_command(server, write_cmd)
 
         if success:
-            logger.info("Клиент сохранён в конфиг")
+            logger.info("Клиент сохранён в конфиг (без рестарта)")
         return success
 
     def _add_client_with_restart(self, server, uuid, email):
@@ -173,6 +191,16 @@ class VPNManager:
             logger.error(f"Ошибка парсинга конфига: {e}, данные: {config_str[:500]}")
             return False
 
+        # Ищем VLESS inbound
+        vless_inbound = None
+        for inbound in config.get('inbounds', []):
+            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
+                vless_inbound = inbound
+                break
+
+        if not vless_inbound:
+            vless_inbound = config['inbounds'][0]
+
         # Добавляем клиента
         new_client = {
             "id": uuid,
@@ -180,8 +208,8 @@ class VPNManager:
             "email": email
         }
 
-        config['inbounds'][0]['settings']['clients'].append(new_client)
-        logger.info(f"Клиент добавлен в конфиг, всего клиентов: {len(config['inbounds'][0]['settings']['clients'])}")
+        vless_inbound['settings']['clients'].append(new_client)
+        logger.info(f"Клиент добавлен в конфиг, всего клиентов: {len(vless_inbound['settings']['clients'])}")
 
         # Записываем обновленный конфиг
         config_json = json.dumps(config)
@@ -204,19 +232,20 @@ class VPNManager:
         return success
 
     def remove_client_via_api(self, server, email):
-        """Удаляет клиента через Xray API без перезапуска"""
-        api_cmd = f'xray api rmi -s 127.0.0.1:10085 user --inbound=vless --email={email}'
+        """Удаляет клиента через Xray gRPC API без перезапуска"""
+        # rmu = Remove User (НЕ rmi, который Remove Inbound)
+        api_cmd = f'xray api rmu -s 127.0.0.1:10085 --inbound=vless --email={email}'
         result, success = self._ssh_command(server, api_cmd)
 
         if success:
-            logger.info(f"Клиент {email} удалён через API")
+            logger.info(f"Клиент {email} удалён через API (rmu)")
             return True
         else:
-            logger.warning(f"API удаления не сработал: {result}")
+            logger.warning(f"API rmu не сработал: {result}")
             return False
 
     def remove_client_from_xray(self, server, uuid):
-        """Удаляет клиента из конфига Xray через SSH"""
+        """Удаляет клиента из Xray через SSH"""
         # Читаем конфиг чтобы найти email клиента
         read_cmd = f"cat {XRAY_CONFIG_PATH}"
         config_str, success = self._ssh_command(server, read_cmd)
@@ -229,18 +258,29 @@ class VPNManager:
         except:
             return False
 
+        # Ищем VLESS inbound
+        vless_inbound = None
+        for inbound in config.get('inbounds', []):
+            if inbound.get('protocol') == 'vless' or inbound.get('tag') == 'vless':
+                vless_inbound = inbound
+                break
+
+        if not vless_inbound:
+            vless_inbound = config['inbounds'][0]
+
+        clients = vless_inbound['settings']['clients']
+
         # Находим email клиента по uuid
-        clients = config['inbounds'][0]['settings']['clients']
         client_email = None
         for c in clients:
             if c['id'] == uuid:
                 client_email = c.get('email')
                 break
 
-        # Пробуем удалить через API
+        # Пробуем удалить через API (без перезапуска)
         if client_email and self.remove_client_via_api(server, client_email):
-            # Удаляем из конфига для персистентности
-            config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != uuid]
+            # Удаляем из конфига для персистентности (без restart)
+            vless_inbound['settings']['clients'] = [c for c in clients if c['id'] != uuid]
             config_json = json.dumps(config)
             config_b64 = base64.b64encode(config_json.encode()).decode()
             write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
@@ -248,7 +288,7 @@ class VPNManager:
             return True
 
         # Fallback: удаляем из конфига и перезапускаем
-        config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != uuid]
+        vless_inbound['settings']['clients'] = [c for c in clients if c['id'] != uuid]
         config_json = json.dumps(config)
         config_b64 = base64.b64encode(config_json.encode()).decode()
         write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
