@@ -92,10 +92,72 @@ class VPNManager:
             f"&type=tcp&headerType=none#{name}"
         )
 
+    def add_client_via_api(self, server, uuid, email):
+        """Добавляет клиента через Xray API без перезапуска"""
+        # Формируем команду для Xray API
+        api_cmd = f'xray api adi -s 127.0.0.1:10085 user --inbound=vless --email={email} --uuid={uuid} --flow=xtls-rprx-vision'
+        result, success = self._ssh_command(server, api_cmd)
+
+        if success:
+            logger.info(f"Клиент {email} добавлен через API")
+            return True
+        else:
+            logger.warning(f"API не сработал: {result}, пробую через конфиг")
+            return False
+
     def add_client_to_xray(self, server, uuid, email):
         """Добавляет клиента в конфиг Xray через SSH"""
         logger.info(f"Добавляю клиента {email} на сервер {server['ip']}")
 
+        # Сначала пробуем через API (без перезапуска)
+        if self.add_client_via_api(server, uuid, email):
+            # API сработал, но нужно также сохранить в конфиг для персистентности
+            self._save_client_to_config(server, uuid, email)
+            return True
+
+        # Fallback: старый способ с перезапуском
+        logger.info("Используем fallback с перезапуском")
+        return self._add_client_with_restart(server, uuid, email)
+
+    def _save_client_to_config(self, server, uuid, email):
+        """Сохраняет клиента в конфиг без перезапуска (для персистентности)"""
+        read_cmd = f"cat {XRAY_CONFIG_PATH}"
+        config_str, success = self._ssh_command(server, read_cmd)
+
+        if not success:
+            logger.error(f"Не удалось прочитать конфиг для сохранения")
+            return False
+
+        try:
+            config = json.loads(config_str)
+        except json.JSONDecodeError:
+            return False
+
+        # Проверяем, нет ли уже такого клиента
+        clients = config['inbounds'][0]['settings']['clients']
+        if any(c['id'] == uuid for c in clients):
+            return True  # Уже есть
+
+        # Добавляем клиента
+        new_client = {
+            "id": uuid,
+            "flow": "xtls-rprx-vision",
+            "email": email
+        }
+        config['inbounds'][0]['settings']['clients'].append(new_client)
+
+        # Записываем конфиг
+        config_json = json.dumps(config)
+        config_b64 = base64.b64encode(config_json.encode()).decode()
+        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
+        _, success = self._ssh_command(server, write_cmd)
+
+        if success:
+            logger.info("Клиент сохранён в конфиг")
+        return success
+
+    def _add_client_with_restart(self, server, uuid, email):
+        """Добавляет клиента через конфиг с перезапуском (fallback)"""
         # Читаем текущий конфиг
         read_cmd = f"cat {XRAY_CONFIG_PATH}"
         config_str, success = self._ssh_command(server, read_cmd)
@@ -141,8 +203,21 @@ class VPNManager:
             logger.error("Ошибка перезапуска xray")
         return success
 
+    def remove_client_via_api(self, server, email):
+        """Удаляет клиента через Xray API без перезапуска"""
+        api_cmd = f'xray api rmi -s 127.0.0.1:10085 user --inbound=vless --email={email}'
+        result, success = self._ssh_command(server, api_cmd)
+
+        if success:
+            logger.info(f"Клиент {email} удалён через API")
+            return True
+        else:
+            logger.warning(f"API удаления не сработал: {result}")
+            return False
+
     def remove_client_from_xray(self, server, uuid):
         """Удаляет клиента из конфига Xray через SSH"""
+        # Читаем конфиг чтобы найти email клиента
         read_cmd = f"cat {XRAY_CONFIG_PATH}"
         config_str, success = self._ssh_command(server, read_cmd)
 
@@ -154,13 +229,29 @@ class VPNManager:
         except:
             return False
 
-        # Удаляем клиента
+        # Находим email клиента по uuid
         clients = config['inbounds'][0]['settings']['clients']
-        config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != uuid]
+        client_email = None
+        for c in clients:
+            if c['id'] == uuid:
+                client_email = c.get('email')
+                break
 
-        # Записываем и перезапускаем
-        config_json = json.dumps(config, indent=2).replace('"', '\\"')
-        write_cmd = f'echo "{config_json}" > {XRAY_CONFIG_PATH}'
+        # Пробуем удалить через API
+        if client_email and self.remove_client_via_api(server, client_email):
+            # Удаляем из конфига для персистентности
+            config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != uuid]
+            config_json = json.dumps(config)
+            config_b64 = base64.b64encode(config_json.encode()).decode()
+            write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
+            self._ssh_command(server, write_cmd)
+            return True
+
+        # Fallback: удаляем из конфига и перезапускаем
+        config['inbounds'][0]['settings']['clients'] = [c for c in clients if c['id'] != uuid]
+        config_json = json.dumps(config)
+        config_b64 = base64.b64encode(config_json.encode()).decode()
+        write_cmd = f'echo {config_b64} | base64 -d > {XRAY_CONFIG_PATH}'
         self._ssh_command(server, write_cmd)
         self._ssh_command(server, "systemctl restart xray")
         return True
